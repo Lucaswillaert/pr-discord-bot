@@ -1,32 +1,45 @@
-require('dotenv').config();
+// File: api/github-webhook.js
+import crypto from 'crypto';
+import { Client, GatewayIntentBits } from 'discord.js';
 
-const express = require('express');
-const { Client, GatewayIntentBits } = require('discord.js');
-const bodyParser = require('body-parser');
+export const config = {
+  api: {
+    bodyParser: false, // raw body nodig voor HMAC
+  },
+};
 
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_ID = process.env.CHANNEL_ID;
+let discordClient;
+let loginPromise;
 
-if (!DISCORD_TOKEN || !CHANNEL_ID) {
-  console.error('Missing DISCORD_TOKEN or CHANNEL_ID environment variables.');
-  process.exit(1);
+function getDiscordClient() {
+  if (!discordClient) {
+    discordClient = new Client({
+      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+    });
+    loginPromise = discordClient.login(process.env.DISCORD_TOKEN);
+    loginPromise.catch((err) => {
+      console.error('Discord login failed:', err);
+    });
+  }
+  return loginPromise.then(() => discordClient);
 }
 
-const app = express();
+function verifySignature(req, rawBody) {
+  const secret = process.env.GITHUB_WEBHOOK_SECRET;
+  const sig = req.headers['x-hub-signature-256'];
+  if (!secret || !sig) return false;
+  const hmac = crypto.createHmac('sha256', secret);
+  const digest = 'sha256=' + hmac.update(rawBody).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig));
+  } catch {
+    return false;
+  }
+}
 
-app.use(bodyParser.json());
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-});
-
-client.once('clientReady', () => {
-  console.log('Discord bot is online!');
-});
-
-async function handlePullRequestOpened(req) {
-  const pr = req.body.pull_request;
-  const repo = req.body.repository?.full_name;
+async function handlePullRequestOpened(payload) {
+  const pr = payload.pull_request;
+  const repo = payload.repository?.full_name;
   const author = pr?.user?.login;
   const baseBranch = pr?.base?.ref;
   const headBranch = pr?.head?.ref;
@@ -38,49 +51,49 @@ async function handlePullRequestOpened(req) {
     `Branches: ${headBranch} → ${baseBranch}\n` +
     `${pr?.html_url}`;
 
-  const channel = await client.channels.fetch(CHANNEL_ID);
+  const client = await getDiscordClient();
+  const channel = await client.channels.fetch(process.env.CHANNEL_ID);
   await channel.send(message);
 
   console.log(`PR notified: ${repo} - ${pr?.title}`);
 }
 
-// Core webhook handler (mounted on both "/" and "/github-webhook")
-async function githubWebhookHandler(req, res) {
+export default async function handler(req, res) {
+  if (req.method === 'GET') {
+    return res.status(200).json({ ok: true, route: '/api/github-webhook' });
+  }
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
+
+  // Lees raw body
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const rawBody = Buffer.concat(chunks);
+
+  // Verify HMAC
+  if (!verifySignature(req, rawBody)) {
+    return res.status(401).send('invalid signature');
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    return res.status(400).send('invalid json');
+  }
+
   try {
     const event = req.headers['x-github-event'];
-    const action = req.body?.action;
+    const action = payload?.action;
 
-    // Only notify on newly opened PRs
     if (event === 'pull_request' && action === 'opened') {
-      await handlePullRequestOpened(req);
+      await handlePullRequestOpened(payload);
     }
 
-    res.status(200).send('OK');
+    return res.status(200).send('OK');
   } catch (err) {
     console.error('Webhook handler error:', err);
-
-    res.status(200).send('Received');
+    return res.status(200).send('Received');
   }
 }
-
-// Mount routes to match your GitHub settings and your code
-app.post('/', githubWebhookHandler);
-app.post('/github-webhook', githubWebhookHandler);
-
-// Simple healthcheck (useful for Railway Healthcheck Path)
-app.get('/', (_req, res) => {
-  res.status(200).send('Alive');
-});
-
-app.use((err, _req, res, _next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).send('Internal Server Error');
-});
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`Webhook server draait op poort ${PORT}`);
-});
-
-client.login(DISCORD_TOKEN);
