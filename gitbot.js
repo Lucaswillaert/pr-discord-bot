@@ -24,7 +24,6 @@ client.once('clientReady', () => {
   console.log('Discord bot is online!');
 });
 
-// Helper to handle PR notifications
 async function handlePullRequestOpened(req) {
   const pr = req.body.pull_request;
   const repo = req.body.repository?.full_name;
@@ -49,7 +48,7 @@ async function handlePullRequestOpened(req) {
 async function githubWebhookHandler(req, res) {
   try {
     const event = req.headers['x-github-event'];
-    const action = req.body?.action; // FIX: define action from payload
+    const action = req.body?.action;
 
     // Only notify on newly opened PRs
     if (event === 'pull_request' && action === 'opened') {
@@ -59,21 +58,20 @@ async function githubWebhookHandler(req, res) {
     res.status(200).send('OK');
   } catch (err) {
     console.error('Webhook handler error:', err);
-    // Still return 200 to prevent GitHub retries storm; log for debugging
+
     res.status(200).send('Received');
   }
 }
 
 // Mount routes to match your GitHub settings and your code
-app.post('/', githubWebhookHandler); // matches current GitHub payload URL (root)
-app.post('/github-webhook', githubWebhookHandler); // matches your original endpoint
+app.post('/', githubWebhookHandler);
+app.post('/github-webhook', githubWebhookHandler);
 
 // Simple healthcheck (useful for Railway Healthcheck Path)
 app.get('/', (_req, res) => {
   res.status(200).send('Alive');
 });
 
-// Basic error handler to avoid crashing the process
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err);
   res.status(500).send('Internal Server Error');
