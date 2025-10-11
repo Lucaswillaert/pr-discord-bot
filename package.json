@@ -1,13 +1,20 @@
 {
   "name": "pr-discord-bot",
   "version": "1.0.0",
-  "description": "",
+  "description": "A Discord bot that sends notifications when pull requests are opened on GitHub",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
+    "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
     "start": "node gitbot.js"
   },
-  "keywords": [],
+  "keywords": [
+    "discord",
+    "github",
+    "webhook",
+    "vercel"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
@@ -15,5 +22,13 @@
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.3",
     "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "jest": "^30.2.0",
+    "node-mocks-http": "^1.17.2"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "transform": {}
   }
 }

@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "functions": {
+    "api/**/*.js": {
+      "maxDuration": 10
+    }
+  },
+  "env": {
+    "DISCORD_TOKEN": "@discord-token",
+    "CHANNEL_ID": "@channel-id",
+    "GITHUB_WEBHOOK_SECRET": "@github-webhook-secret"
+  }
+}
