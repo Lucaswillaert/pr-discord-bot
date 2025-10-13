@@ -1,99 +1,164 @@
-// File: api/github-webhook.js
+// File: server.js
+import http from 'http';
 import crypto from 'crypto';
 import { Client, GatewayIntentBits } from 'discord.js';
 
-export const config = {
-  api: {
-    bodyParser: false, // raw body nodig voor HMAC
-  },
-};
+// Env vars
+const {
+  PORT = 3000,
+  DISCORD_TOKEN,
+  CHANNEL_ID,
+  GITHUB_WEBHOOK_SECRET,
+} = process.env;
 
-let discordClient;
-let loginPromise;
-
-function getDiscordClient() {
-  if (!discordClient) {
-    discordClient = new Client({
-      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-    });
-    loginPromise = discordClient.login(process.env.DISCORD_TOKEN);
-    loginPromise.catch((err) => {
-      console.error('Discord login failed:', err);
-    });
-  }
-  return loginPromise.then(() => discordClient);
+// Basis warnings (niet fataal voor health)
+if (!GITHUB_WEBHOOK_SECRET) {
+  console.warn(
+    'GITHUB_WEBHOOK_SECRET ontbreekt — signature verificatie zal falen.'
+  );
+}
+if (!DISCORD_TOKEN || !CHANNEL_ID) {
+  console.warn(
+    'DISCORD_TOKEN of CHANNEL_ID ontbreekt — Discord notificaties worden overgeslagen.'
+  );
 }
 
-function verifySignature(req, rawBody) {
-  const secret = process.env.GITHUB_WEBHOOK_SECRET;
-  const sig = req.headers['x-hub-signature-256'];
-  if (!secret || !sig) return false;
+// Lazy Discord client init met retry
+let discordClient = null;
+let discordLoginPromise = null;
+
+function getDiscordClient() {
+  if (!DISCORD_TOKEN || !CHANNEL_ID) {
+    throw new Error('Missing DISCORD_TOKEN or CHANNEL_ID');
+  }
+  if (!discordClient) {
+    discordClient = new Client({ intents: [GatewayIntentBits.Guilds] });
+    discordLoginPromise = discordClient.login(DISCORD_TOKEN).catch((err) => {
+      console.error('Discord login failed:', err);
+      // Reset zodat we later opnieuw kunnen proberen
+      discordClient = null;
+      discordLoginPromise = null;
+      throw err;
+    });
+  }
+  return discordLoginPromise.then(() => discordClient);
+}
+
+function verifySignatureRaw(signatureHeader, rawBody, secret) {
+  if (!signatureHeader || !secret) return false;
   const hmac = crypto.createHmac('sha256', secret);
-  const digest = 'sha256=' + hmac.update(rawBody).digest('hex');
+  const expected = 'sha256=' + hmac.update(rawBody).digest('hex');
   try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig));
+    return crypto.timingSafeEqual(
+      Buffer.from(expected),
+      Buffer.from(signatureHeader)
+    );
   } catch {
     return false;
   }
 }
 
-async function handlePullRequestOpened(payload) {
+async function notifyPullRequestOpened(payload) {
   const pr = payload.pull_request;
-  const repo = payload.repository?.full_name;
-  const author = pr?.user?.login;
-  const baseBranch = pr?.base?.ref;
-  const headBranch = pr?.head?.ref;
+  const repo = payload.repository?.full_name ?? 'unknown repo';
+  const author = pr?.user?.login ?? 'unknown author';
+  const baseBranch = pr?.base?.ref ?? 'unknown base';
+  const headBranch = pr?.head?.ref ?? 'unknown head';
 
   const message =
     `Nieuwe pull request in **${repo}**\n` +
-    `Titel: ${pr?.title}\n` +
+    `Titel: ${pr?.title ?? 'zonder titel'}\n` +
     `Auteur: ${author}\n` +
     `Branches: ${headBranch} → ${baseBranch}\n` +
-    `${pr?.html_url}`;
+    `${pr?.html_url ?? ''}`;
 
   const client = await getDiscordClient();
-  const channel = await client.channels.fetch(process.env.CHANNEL_ID);
+  const channel = await client.channels.fetch(CHANNEL_ID);
   await channel.send(message);
-
   console.log(`PR notified: ${repo} - ${pr?.title}`);
 }
 
-export default async function handler(req, res) {
-  if (req.method === 'GET') {
-    return res.status(200).json({ ok: true, route: '/api/github-webhook' });
+function sendJson(res, status, obj) {
+  const body = Buffer.from(JSON.stringify(obj));
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Content-Length': body.length,
+  });
+  res.end(body);
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const path = url.pathname;
+
+  // Health endpoints zodat Railway “/” niet 499/502 geeft
+  if (req.method === 'GET' && path === '/') {
+    return sendJson(res, 200, {
+      ok: true,
+      service: 'pr-discord-bot',
+      time: new Date().toISOString(),
+    });
   }
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+  if (req.method === 'GET' && path === '/github-webhooks') {
+    return sendJson(res, 200, {
+      ok: true,
+      route: '/github-webhooks',
+      time: new Date().toISOString(),
+    });
   }
 
-  // Lees raw body
+  if (req.method !== 'POST' || path !== '/github-webhooks') {
+    return sendJson(res, 404, { error: 'Not Found' });
+  }
+
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const rawBody = Buffer.concat(chunks);
-
-  // Verify HMAC
-  if (!verifySignature(req, rawBody)) {
-    return res.status(401).send('invalid signature');
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(rawBody.toString('utf8'));
-  } catch {
-    return res.status(400).send('invalid json');
-  }
-
-  try {
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', () => {
+    const rawBody = Buffer.concat(chunks);
+    const signature = req.headers['x-hub-signature-256'];
     const event = req.headers['x-github-event'];
-    const action = payload?.action;
+    const deliveryId = req.headers['x-github-delivery'];
 
-    if (event === 'pull_request' && action === 'opened') {
-      await handlePullRequestOpened(payload);
+    if (!verifySignatureRaw(signature, rawBody, GITHUB_WEBHOOK_SECRET)) {
+      console.warn(`Signature mismatch. delivery=${deliveryId}`);
+      return sendJson(res, 401, { error: 'invalid signature' });
     }
 
-    return res.status(200).send('OK');
-  } catch (err) {
-    console.error('Webhook handler error:', err);
-    return res.status(200).send('Received');
-  }
-}
+    let payload;
+    try {
+      payload = JSON.parse(rawBody.toString('utf8'));
+    } catch (e) {
+      console.warn(`Invalid JSON. delivery=${deliveryId}`, e);
+      return sendJson(res, 400, { error: 'invalid json' });
+    }
+
+    // Snel ACK om 499 te voorkomen
+    sendJson(res, 202, { received: true, delivery: deliveryId });
+
+    // Async verwerking
+    (async () => {
+      try {
+        console.log(
+          `GitHub event=${event} action=${payload?.action} delivery=${deliveryId}`
+        );
+        if (event === 'pull_request' && payload?.action === 'opened') {
+          await notifyPullRequestOpened(payload);
+        } else {
+          console.log(`Unhandled event/action: ${event}/${payload?.action}`);
+        }
+      } catch (err) {
+        console.error('Async handler error:', err);
+      }
+    })();
+  });
+
+  req.on('error', (err) => {
+    console.error('Request stream error:', err);
+    if (!res.writableEnded)
+      sendJson(res, 400, { error: 'request stream error' });
+  });
+});
+
+server.listen(Number(PORT), () => {
+  console.log(`Server listening on :${PORT} — POST /github-webhooks`);
+});
