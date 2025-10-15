@@ -1,9 +1,8 @@
-// File: server.js
+// File: gitbot.js
 import http from 'http';
 import crypto from 'crypto';
 import { Client, GatewayIntentBits } from 'discord.js';
 
-// Env vars
 const {
   PORT = 3000,
   DISCORD_TOKEN,
@@ -11,7 +10,6 @@ const {
   GITHUB_WEBHOOK_SECRET,
 } = process.env;
 
-// Basis warnings (niet fataal voor health)
 if (!GITHUB_WEBHOOK_SECRET) {
   console.warn(
     'GITHUB_WEBHOOK_SECRET ontbreekt — signature verificatie zal falen.'
@@ -23,7 +21,6 @@ if (!DISCORD_TOKEN || !CHANNEL_ID) {
   );
 }
 
-// Lazy Discord client init met retry
 let discordClient = null;
 let discordLoginPromise = null;
 
@@ -35,7 +32,6 @@ function getDiscordClient() {
     discordClient = new Client({ intents: [GatewayIntentBits.Guilds] });
     discordLoginPromise = discordClient.login(DISCORD_TOKEN).catch((err) => {
       console.error('Discord login failed:', err);
-      // Reset zodat we later opnieuw kunnen proberen
       discordClient = null;
       discordLoginPromise = null;
       throw err;
@@ -88,10 +84,16 @@ function sendJson(res, status, obj) {
 }
 
 const server = http.createServer((req, res) => {
+  const start = Date.now();
   const url = new URL(req.url, `http://${req.headers.host}`);
   const path = url.pathname;
 
-  // Health endpoints zodat Railway “/” niet 499/502 geeft
+  console.log(
+    `[${new Date().toISOString()}] ${req.method} ${path} from ${
+      req.socket.remoteAddress
+    }`
+  );
+
   if (req.method === 'GET' && path === '/') {
     return sendJson(res, 200, {
       ok: true,
@@ -108,7 +110,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method !== 'POST' || path !== '/github-webhooks') {
-    return sendJson(res, 404, { error: 'Not Found' });
+    return sendJson(res, 404, { error: 'Not Found', path });
   }
 
   const chunks = [];
@@ -132,14 +134,15 @@ const server = http.createServer((req, res) => {
       return sendJson(res, 400, { error: 'invalid json' });
     }
 
-    // Snel ACK om 499 te voorkomen
+    // Quick ACK
     sendJson(res, 202, { received: true, delivery: deliveryId });
 
-    // Async verwerking
     (async () => {
       try {
         console.log(
-          `GitHub event=${event} action=${payload?.action} delivery=${deliveryId}`
+          `GitHub event=${event} action=${
+            payload?.action
+          } delivery=${deliveryId} (${Date.now() - start}ms to ACK)`
         );
         if (event === 'pull_request' && payload?.action === 'opened') {
           await notifyPullRequestOpened(payload);
@@ -159,6 +162,7 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(Number(PORT), () => {
+// Belangrijk: bind op 0.0.0.0 zodat Railway/edge kan connecteren
+server.listen(Number(PORT), '0.0.0.0', () => {
   console.log(`Server listening on :${PORT} — POST /github-webhooks`);
 });
