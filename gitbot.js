@@ -1,5 +1,6 @@
 // File: gitbot.js
 import http from 'http';
+import https from 'https';
 import crypto from 'crypto';
 import { Client, GatewayIntentBits } from 'discord.js';
 
@@ -8,6 +9,7 @@ const {
   DISCORD_TOKEN,
   CHANNEL_ID,
   GITHUB_WEBHOOK_SECRET,
+  RAILWAY_PUBLIC_DOMAIN, // Railway sets this automatically
 } = process.env;
 
 if (!GITHUB_WEBHOOK_SECRET) {
@@ -99,6 +101,16 @@ const server = http.createServer((req, res) => {
       ok: true,
       service: 'pr-discord-bot',
       time: new Date().toISOString(),
+      uptime: process.uptime(),
+    });
+  }
+  if (req.method === 'GET' && path === '/health') {
+    return sendJson(res, 200, {
+      ok: true,
+      status: 'healthy',
+      time: new Date().toISOString(),
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
     });
   }
   if (req.method === 'GET' && path === '/github-webhooks') {
@@ -162,7 +174,32 @@ const server = http.createServer((req, res) => {
   });
 });
 
+// Keep-alive mechanism for Railway free tier
+function keepAlive() {
+  if (!RAILWAY_PUBLIC_DOMAIN) {
+    console.log('RAILWAY_PUBLIC_DOMAIN not set, skipping keep-alive');
+    return;
+  }
+
+  const url = `https://${RAILWAY_PUBLIC_DOMAIN}/`;
+  console.log(`Keep-alive ping to: ${url}`);
+
+  https
+    .get(url, (res) => {
+      console.log(`Keep-alive response: ${res.statusCode}`);
+    })
+    .on('error', (err) => {
+      console.log(`Keep-alive error: ${err.message}`);
+    });
+}
+
+// Ping every 14 minutes (Railway sleeps after 15 minutes of inactivity)
+setInterval(keepAlive, 14 * 60 * 1000);
+
 // Belangrijk: bind op 0.0.0.0 zodat Railway/edge kan connecteren
 server.listen(Number(PORT), '0.0.0.0', () => {
   console.log(`Server listening on :${PORT} — POST /github-webhooks`);
+
+  // Initial keep-alive ping after 1 minute
+  setTimeout(keepAlive, 60 * 1000);
 });
